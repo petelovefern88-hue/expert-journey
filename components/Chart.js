@@ -1,81 +1,101 @@
-// ✅ components/Chart.js — Real TradingView Chart Renderer (with EMA20/50/200)
 import { useEffect, useRef } from "react";
-import { createChart } from "lightweight-charts";
+import { createChart, ColorType } from "lightweight-charts";
 
 export default function Chart({ candles = [], markers = [] }) {
-  const chartContainerRef = useRef();
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const candleRef = useRef(null);
+  const emaRef = useRef({});
 
+  const calcEMA = (data, period) => {
+    if (!data?.length) return [];
+
+    const k = 2 / (period + 1);
+    let ema = data[0].close;
+
+    return data.map((d, i) => {
+      ema = i === 0 ? d.close : d.close * k + ema * (1 - k);
+
+      return {
+        time: Math.floor(d.time / 1000),
+        value: ema,
+      };
+    });
+  };
+
+  // INIT ONLY ONCE
   useEffect(() => {
-    if (!chartContainerRef.current || !candles.length) return;
+    if (!containerRef.current || chartRef.current) return;
 
-    chartContainerRef.current.innerHTML = "";
-    const chart = createChart(chartContainerRef.current, {
+    const chart = createChart(containerRef.current, {
       layout: {
-        background: { color: "#0b1220" },
+        background: { type: ColorType.Solid, color: "#0b1220" },
         textColor: "#d1d5db",
       },
       grid: {
         vertLines: { color: "rgba(255,255,255,0.05)" },
         horzLines: { color: "rgba(255,255,255,0.05)" },
       },
-      width: chartContainerRef.current.clientWidth,
+      width: containerRef.current.clientWidth,
       height: 320,
-      timeScale: { borderColor: "rgba(255,255,255,0.2)" },
-      rightPriceScale: { borderColor: "rgba(255,255,255,0.2)" },
+      timeScale: { timeVisible: true },
     });
 
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: "#22c55e",
-      downColor: "#ef4444",
-      borderVisible: false,
-      wickUpColor: "#22c55e",
-      wickDownColor: "#ef4444",
-    });
+    chartRef.current = chart;
 
-    candleSeries.setData(
-      candles.map((c) => ({
-        time: Math.floor(c.time / 1000),
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-      }))
-    );
+    // Candle
+    const candle = chart.addCandlestickSeries();
+    candleRef.current = candle;
 
-    const ema = (data, period) => {
-      const k = 2 / (period + 1);
-      let emaArr = [];
-      let prev = data[0].close;
-      data.forEach((d, i) => {
-        const val = i === 0 ? d.close : d.close * k + prev * (1 - k);
-        emaArr.push({ time: Math.floor(d.time / 1000), value: val });
-        prev = val;
+    // EMA lines
+    emaRef.current.ema20 = chart.addLineSeries({ color: "#22c55e" });
+    emaRef.current.ema50 = chart.addLineSeries({ color: "#eab308" });
+    emaRef.current.ema200 = chart.addLineSeries({ color: "#3b82f6" });
+
+    // Resize safe (no SSR crash)
+    const handleResize = () => {
+      if (!containerRef.current) return;
+      chart.applyOptions({
+        width: containerRef.current.clientWidth,
       });
-      return emaArr;
     };
 
-    const ema20 = chart.addLineSeries({ color: "#22c55e", lineWidth: 1.5 });
-    const ema50 = chart.addLineSeries({ color: "#eab308", lineWidth: 1.5 });
-    const ema200 = chart.addLineSeries({ color: "#3b82f6", lineWidth: 1.5 });
-
-    ema20.setData(ema(candles, 20));
-    ema50.setData(ema(candles, 50));
-    ema200.setData(ema(candles, 200));
-
-    if (markers?.length) {
-      candleSeries.setMarkers(markers);
-    }
-
-    const resize = () => {
-      chart.applyOptions({ width: chartContainerRef.current.clientWidth });
-    };
-    window.addEventListener("resize", resize);
+    window.addEventListener("resize", handleResize);
 
     return () => {
-      window.removeEventListener("resize", resize);
+      window.removeEventListener("resize", handleResize);
       chart.remove();
+      chartRef.current = null;
     };
-  }, [candles, markers]);
+  }, []);
 
-  return <div ref={chartContainerRef} className="w-full h-[320px]" />;
+  // UPDATE DATA
+  useEffect(() => {
+    if (!candles.length || !candleRef.current) return;
+
+    const sorted = [...candles].sort((a, b) => a.time - b.time);
+
+    const formatted = sorted.map((c) => ({
+      time: Math.floor(c.time / 1000),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }));
+
+    candleRef.current.setData(formatted);
+
+    emaRef.current.ema20?.setData(calcEMA(sorted, 20));
+    emaRef.current.ema50?.setData(calcEMA(sorted, 50));
+    emaRef.current.ema200?.setData(calcEMA(sorted, 200));
+  }, [candles]);
+
+  // MARKERS
+  useEffect(() => {
+    if (markers.length && candleRef.current) {
+      candleRef.current.setMarkers(markers);
+    }
+  }, [markers]);
+
+  return <div ref={containerRef} className="w-full h-[320px]" />;
 }
