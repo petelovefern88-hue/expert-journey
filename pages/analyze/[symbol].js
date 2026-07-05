@@ -1,10 +1,18 @@
-// ✅ /pages/analyze/[symbol].js — Visionary Analyzer (Stock + Option + AI Entry Zone + Compact Font + TP/SL Breakout v∞.12)
+// ✅ /pages/analyze/[symbol].js — Visionary Analyzer (Stock + Option + AI Entry Zone + Compact Font + TP/SL Breakout v∞.13)
 import { useRouter } from "next/router";
 import { useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 
 const Chart = dynamic(() => import("../../components/Chart.js"), { ssr: false });
 const fmt = (n, d = 2) => (Number.isFinite(n) ? Number(n).toFixed(d) : "-");
+
+// Fetch helper that throws on non-2xx instead of letting a bad response
+// (e.g. an HTML error page) crash `.json()` downstream.
+async function fetchJson(url, signal) {
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`${url} responded ${res.status}`);
+  return res.json();
+}
 
 // ✅ ฟังก์ชันคำนวณ TP / SL ที่ปรับอัตโนมัติเมื่อทะลุแนวต้าน
 function computeSmartTargetAndSL(data) {
@@ -19,8 +27,11 @@ function computeSmartTargetAndSL(data) {
   const emaTrendStrength = (emaGap20_50 + emaGap50_200) / 2;
   const volBoost = volume ? Math.min(volume / 1_000_000, 3) : 1;
 
-  // === หาแนวต้านหลัก ===
-  const resistances = [ema20, ema50, ema200].filter(v => v > lastClose).sort((a, b) => a - b);
+  // === หาแนวต้านหลัก (รวมราคาสูงสุดล่าสุดเป็นแนวต้านเสริม) ===
+  const resistanceCandidates = [ema20, ema50, ema200, Number.isFinite(high) ? high : null].filter(
+    (v) => Number.isFinite(v) && v > lastClose
+  );
+  const resistances = resistanceCandidates.sort((a, b) => a - b);
   const firstRes = resistances[0] || lastClose * 1.05;
   const nextRes = resistances[1] || firstRes * 1.05;
 
@@ -32,8 +43,13 @@ function computeSmartTargetAndSL(data) {
 
   let slFactor = 0.96;
   if (ema20 < ema50 && ema50 < ema200) slFactor = 0.93;
-  if (rsi < 35) slFactor = 0.90;
-  const stopLoss = lastClose * slFactor;
+  if (rsi < 35) slFactor = 0.9;
+  // If a recent swing low is tighter (closer to price) than the EMA-based
+  // stop, prefer it — it's a more literal support level for the stock.
+  let stopLoss = lastClose * slFactor;
+  if (Number.isFinite(low) && low < lastClose && low > stopLoss) {
+    stopLoss = low * 0.995;
+  }
 
   const confRaw =
     Math.abs(emaGap20_50 * 3) +
@@ -52,7 +68,7 @@ function computeSmartTargetAndSL(data) {
 }
 
 export default function Analyze() {
-  const { query } = useRouter();
+  const { query, isReady } = useRouter();
   const symbol = (query.symbol || "").toString().toUpperCase();
   const [core, setCore] = useState(null);
   const [scanner, setScanner] = useState(null);
@@ -60,65 +76,72 @@ export default function Analyze() {
   const [news, setNews] = useState([]);
   const [mode, setMode] = useState("stock");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
 
-  // ===== โหลดข้อมูลหุ้นหลัก =====
+  // ===== โหลดข้อมูลหุ้นหลัก + option ในรอบเดียว, ยกเลิกเมื่อ symbol เปลี่ยน =====
   useEffect(() => {
-    if (!symbol) return;
+    if (!isReady || !symbol) return;
+
+    const controller = new AbortController();
+    let cancelled = false;
+
     (async () => {
       setLoading(true);
+      setLoadError(null);
       try {
-        const infiniteRes = await fetch(`/api/visionary-infinite-core?symbol=${symbol}`).then(r => r.json());
+        const infiniteRes = await fetchJson(
+          `/api/visionary-infinite-core?symbol=${symbol}`,
+          controller.signal
+        ).catch(() => null);
         const isInfiniteOk = infiniteRes && !infiniteRes.error && infiniteRes.symbol;
 
-        try {
-          const optExtra = await fetch(`/api/visionary-option-core?symbol=${symbol}`).then(r => r.json());
-          if (optExtra && !optExtra.error) setOptionAI(optExtra);
-        } catch (err) {
-          console.warn("⚠️ Option Core fetch fail:", err);
+        let coreData = infiniteRes;
+        let newsItems = infiniteRes?.news || [];
+
+        if (!isInfiniteOk) {
+          const [coreRes, , newsRes] = await Promise.all([
+            fetchJson(`/api/visionary-core?symbol=${symbol}`, controller.signal),
+            fetchJson(`/api/visionary-scanner?symbol=${symbol}`, controller.signal).catch(() => null),
+            fetchJson(`/api/news?symbol=${symbol}`, controller.signal).catch(() => ({ items: [] })),
+          ]);
+          coreData = coreRes;
+          newsItems = newsRes?.items || [];
         }
 
-        const smart = computeSmartTargetAndSL(infiniteRes || {});
-        if (isInfiniteOk) {
-          setCore(infiniteRes);
-          setScanner({
-            targetPrice: smart.target,
-            stopLoss: smart.stopLoss,
-            confidence: smart.confidence,
-            reason: smart.reason,
-          });
-          setNews(infiniteRes.news || []);
-        } else {
-          const [coreRes, scannerRes, newsRes] = await Promise.all([
-            fetch(`/api/visionary-core?symbol=${symbol}`).then(r => r.json()),
-            fetch(`/api/visionary-scanner?symbol=${symbol}`).then(r => r.json()),
-            fetch(`/api/news?symbol=${symbol}`).then(r => r.json()),
-          ]);
-          const smart2 = computeSmartTargetAndSL(coreRes || {});
-          setCore(coreRes);
-          setScanner({
-            targetPrice: smart2.target,
-            stopLoss: smart2.stopLoss,
-            confidence: smart2.confidence,
-            reason: smart2.reason,
-          });
-          setNews(newsRes.items || []);
-        }
+        // Single source of truth for option data — one endpoint, one write to state.
+        // (Previously two effects both wrote optionAI and could race/overwrite each other.)
+        const optionRes = await fetchJson(
+          `/api/visionary-option-ai?symbol=${symbol}`,
+          controller.signal
+        ).catch(() => null);
+
+        if (cancelled) return;
+
+        const smart = computeSmartTargetAndSL(coreData || {});
+        setCore(coreData);
+        setScanner({
+          targetPrice: smart.target,
+          stopLoss: smart.stopLoss,
+          confidence: smart.confidence,
+          reason: smart.reason,
+        });
+        setNews(newsItems);
+        setOptionAI(optionRes);
       } catch (e) {
-        console.error("⚠️ Analyzer fetch error:", e);
+        if (e.name !== "AbortError" && !cancelled) {
+          console.error("⚠️ Analyzer fetch error:", e);
+          setLoadError("โหลดข้อมูลไม่สำเร็จ ลองรีเฟรชอีกครั้ง");
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [symbol]);
 
-  // ===== โหลด Option AI =====
-  useEffect(() => {
-    if (!symbol) return;
-    fetch(`/api/visionary-option-ai?symbol=${symbol}`)
-      .then(r => r.json())
-      .then(setOptionAI)
-      .catch(e => console.error("Option AI error:", e));
-  }, [symbol]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [symbol, isReady]);
 
   const sig = computeSignal(core || {});
   const price = core?.lastClose || 0;
@@ -148,19 +171,41 @@ export default function Analyze() {
       <div className="max-w-6xl mx-auto px-3 py-5 space-y-5">
         <div className="flex justify-between items-center">
           <button onClick={() => window.history.back()} className="text-[12px] bg-white/5 px-3 py-1 rounded border border-white/10 hover:bg-emerald-500/10">← ย้อนกลับ</button>
-          <h1 className="text-[14px] font-bold tracking-widest">{symbol}</h1>
-          <div className="text-emerald-400 font-semibold text-[12px] border border-emerald-400/30 rounded px-2 py-0.5">${fmt(price, 2)}</div>
+          <h1 className="text-[14px] font-bold tracking-widest">{symbol || "…"}</h1>
+          <div className="text-emerald-400 font-semibold text-[12px] border border-emerald-400/30 rounded px-2 py-0.5">
+            {loading ? "…" : `$${fmt(price, 2)}`}
+          </div>
         </div>
 
-        <div className="rounded-2xl border border-white/10 overflow-hidden bg-[#0f172a]"><Chart candles={hist} markers={markers} /></div>
+        {loadError && (
+          <div className="text-[12px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-xl p-2 text-center">
+            {loadError}
+          </div>
+        )}
+
+        <div className="rounded-2xl border border-white/10 overflow-hidden bg-[#0f172a] min-h-[220px]">
+          {loading ? (
+            <div className="h-[220px] flex items-center justify-center text-gray-500 text-[12px] animate-pulse">
+              ⏳ กำลังโหลดกราฟ...
+            </div>
+          ) : (
+            <Chart candles={hist} markers={markers} />
+          )}
+        </div>
 
         <div className="flex justify-center gap-2">
           <button onClick={() => setMode("stock")} className={`px-3 py-1 rounded-md text-[12px] font-bold ${mode === "stock" ? "bg-emerald-500/20 text-emerald-400" : "bg-white/5 text-gray-400"}`}>หุ้นธรรมดา (Stock)</button>
           <button onClick={() => setMode("option")} className={`px-3 py-1 rounded-md text-[12px] font-bold ${mode === "option" ? "bg-pink-500/20 text-pink-400" : "bg-white/5 text-gray-400"}`}>ออปชั่น (Option)</button>
         </div>
 
-        <AISignalSection ind={core} sig={sig} price={price} scanner={scanner} optionAI={optionAI} mode={mode} />
-        <MarketNews news={news} />
+        {loading ? (
+          <div className="rounded-2xl border border-white/10 bg-[#141b2d] p-6 text-center text-gray-500 text-[12px] animate-pulse">
+            ⏳ กำลังวิเคราะห์ข้อมูล...
+          </div>
+        ) : (
+          <AISignalSection ind={core} sig={sig} price={price} scanner={scanner} optionAI={optionAI} mode={mode} />
+        )}
+        <MarketNews news={news} loading={loading} />
       </div>
     </main>
   );
@@ -270,11 +315,13 @@ function AISignalSection({ ind, sig, price, scanner, optionAI, mode }) {
   );
 }
 
-function MarketNews({ news }) {
+function MarketNews({ news, loading }) {
   return (
     <section className="rounded-2xl border border-white/10 bg-[#141b2d] p-3">
       <h2 className="text-[13px] font-bold mb-1 tracking-wide">Market News</h2>
-      {!news?.length ? (
+      {loading ? (
+        <div className="text-[11px] text-gray-500 animate-pulse">⏳ กำลังโหลดข่าว...</div>
+      ) : !news?.length ? (
         <div className="text-[11px] text-gray-400">No recent news.</div>
       ) : (
         <ul className="space-y-1.5">
@@ -290,4 +337,4 @@ function MarketNews({ news }) {
       )}
     </section>
   );
-    }
+}
