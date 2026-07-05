@@ -1,8 +1,5 @@
 {
   "version": 2,
   "framework": "nextjs",
-  "buildCommand": "CI= npm run build",
-  "routes": [
-    { "src": "/(.*)", "dest": "/$1" }
-  ]
+  "buildCommand": "CI= npm run build"
 }
